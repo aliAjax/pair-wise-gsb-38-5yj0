@@ -21,9 +21,10 @@ def utcnow() -> str:
 
 
 class DomainError(Exception):
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, extra: dict[str, Any] | None = None):
         super().__init__(message)
         self.status = status
+        self.extra = extra or {}
 
 
 class Database:
@@ -50,6 +51,7 @@ class Database:
                     owner TEXT NOT NULL,
                     media_name TEXT NOT NULL,
                     media_sha256 TEXT NOT NULL,
+                    source_revision INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS versions (
@@ -131,8 +133,46 @@ class Database:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS source_cues (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    cue_index INTEGER NOT NULL,
+                    start_ms INTEGER NOT NULL CHECK(start_ms >= 0),
+                    end_ms INTEGER NOT NULL CHECK(end_ms > start_ms),
+                    text TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    updated_by TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(project_id,cue_index)
+                );
+                CREATE TABLE IF NOT EXISTS mapping_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+                    batch_no INTEGER NOT NULL,
+                    source_revision INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    idempotency_key TEXT,
+                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','superseded')),
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(version_id,batch_no),
+                    UNIQUE(version_id,idempotency_key)
+                );
+                CREATE TABLE IF NOT EXISTS mappings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL REFERENCES mapping_batches(id) ON DELETE CASCADE,
+                    cue_id INTEGER NOT NULL REFERENCES cues(id) ON DELETE CASCADE,
+                    source_start_index INTEGER NOT NULL,
+                    source_end_index INTEGER NOT NULL,
+                    source_revision INTEGER NOT NULL,
+                    CHECK(source_end_index >= source_start_index)
+                );
                 """
             )
+            # 旧库迁移：projects 表补充原文修订号
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(projects)")}
+            if "source_revision" not in cols:
+                conn.execute("ALTER TABLE projects ADD COLUMN source_revision INTEGER NOT NULL DEFAULT 0")
 
     def _audit(self, conn: sqlite3.Connection, actor: str, action: str, entity_type: str,
                entity_id: int | None, details: dict[str, Any]) -> None:
@@ -295,6 +335,265 @@ class Database:
             self._audit(conn, actor, "cue.saved", "version", version_id, {"cue_id": saved_id, "revision": revision})
         return dict(conn.execute("SELECT * FROM cues WHERE id=?", (saved_id,)).fetchone()) | {"version_revision": revision}
 
+    # ------------------------------------------------------------------
+    # 原文字幕与原文-译文映射
+    # ------------------------------------------------------------------
+
+    def list_source_cues(self, project_id: int) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM source_cues WHERE project_id=? ORDER BY cue_index", (project_id,)).fetchall()]
+
+    def _source_cues(self, conn: sqlite3.Connection, project_id: int) -> dict[int, dict[str, Any]]:
+        return {r["cue_index"]: dict(r) for r in conn.execute("SELECT * FROM source_cues WHERE project_id=?", (project_id,)).fetchall()}
+
+    def _active_batch(self, conn: sqlite3.Connection, version_id: int) -> sqlite3.Row | None:
+        return conn.execute("SELECT * FROM mapping_batches WHERE version_id=? AND status='active' ORDER BY batch_no DESC LIMIT 1", (version_id,)).fetchone()
+
+    def save_source_cue(self, project_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            project = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+            if not project:
+                raise DomainError("项目不存在", 404)
+            if actor != project["owner"] and role != "admin":
+                raise DomainError("只有项目负责人可以维护原文字幕", 403)
+            expected = payload.get("expected_revision")
+            if expected is not None and int(expected) != int(project["source_revision"]):
+                raise DomainError("原文字幕已被其他成员修改，请刷新后重试", 409)
+            try:
+                cue_index = int(payload.get("cue_index"))
+                start_ms = int(payload.get("start_ms"))
+                end_ms = int(payload.get("end_ms"))
+            except (TypeError, ValueError) as exc:
+                raise DomainError("字幕序号和时间必须是整数") from exc
+            text = str(payload.get("text", "")).strip()
+            if cue_index < 0 or start_ms < 0 or end_ms <= start_ms or end_ms > int(project["duration_ms"]) or not text:
+                raise DomainError("字幕时间、序号或内容不合法")
+            cue_id = payload.get("cue_id")
+            existing = None
+            if cue_id is not None:
+                existing = conn.execute("SELECT * FROM source_cues WHERE id=? AND project_id=?", (int(cue_id), project_id)).fetchone()
+                if not existing:
+                    raise DomainError("原文字幕条目不存在", 404)
+            overlap = conn.execute(
+                "SELECT * FROM source_cues WHERE project_id=? AND id<>? AND start_ms<? AND end_ms>? LIMIT 1",
+                (project_id, int(cue_id or -1), end_ms, start_ms),
+            ).fetchone()
+            if overlap:
+                raise DomainError("原文字幕时间轴发生重叠", 409)
+            index_owner = conn.execute("SELECT * FROM source_cues WHERE project_id=? AND cue_index=? AND id<>?", (project_id, cue_index, int(cue_id or -1))).fetchone()
+            if index_owner:
+                raise DomainError("原文字幕序号已被使用", 409)
+            revision = int(project["source_revision"]) + 1
+            if existing:
+                conn.execute("UPDATE source_cues SET cue_index=?,start_ms=?,end_ms=?,text=?,revision=?,updated_by=?,updated_at=? WHERE id=?", (cue_index, start_ms, end_ms, text, revision, actor, utcnow(), existing["id"]))
+                saved_id = existing["id"]
+            else:
+                cur = conn.execute("INSERT INTO source_cues(project_id,cue_index,start_ms,end_ms,text,revision,updated_by,updated_at) VALUES(?,?,?,?,?,?,?,?)", (project_id, cue_index, start_ms, end_ms, text, revision, actor, utcnow()))
+                saved_id = cur.lastrowid
+            conn.execute("UPDATE projects SET source_revision=? WHERE id=?", (revision, project_id))
+            self._audit(conn, actor, "source_cue.saved", "project", project_id, {"cue_id": saved_id, "source_revision": revision})
+            invalidated = self._invalidate_versions(conn, actor, project_id, revision)
+        return dict(conn.execute("SELECT * FROM source_cues WHERE id=?", (saved_id,)).fetchone()) | {"source_revision": revision, "invalidated_versions": invalidated}
+
+    def _invalidate_versions(self, conn: sqlite3.Connection, actor: str, project_id: int, source_revision: int) -> list[int]:
+        """原文变更后，把映射已失效的在审/已批准/已锁定版本退回草稿。"""
+        invalidated = []
+        rows = conn.execute(
+            "SELECT v.*,p.owner,p.duration_ms FROM versions v JOIN projects p ON p.id=v.project_id WHERE v.project_id=? AND v.status IN ('review','approved','locked')",
+            (project_id,),
+        ).fetchall()
+        for v in rows:
+            health = self._mapping_health(conn, v)
+            summary = health["summary"]
+            if summary["pending"] or summary["stale"] or not summary["complete"]:
+                affected = [c["id"] for c in health["items"] if c["mapping_status"] != "fresh"]
+                conn.execute("UPDATE versions SET status='draft',updated_at=? WHERE id=?", (utcnow(), v["id"]))
+                self._audit(conn, actor, "version.review_invalidated", "version", v["id"], {"source_revision": source_revision, "affected_cues": affected})
+                invalidated.append(v["id"])
+        return invalidated
+
+    def _mapping_health(self, conn: sqlite3.Connection, version: sqlite3.Row) -> dict[str, Any]:
+        """按当前原文计算每条译文字幕的映射状态：fresh / stale / pending。"""
+        cues = [dict(r) for r in conn.execute("SELECT * FROM cues WHERE version_id=? ORDER BY cue_index", (version["id"],)).fetchall()]
+        source = self._source_cues(conn, version["project_id"])
+        batch = self._active_batch(conn, version["id"])
+        entries: dict[int, dict[str, Any]] = {}
+        if batch:
+            for m in conn.execute("SELECT * FROM mappings WHERE batch_id=?", (batch["id"],)).fetchall():
+                entries[m["cue_id"]] = dict(m)
+        items = []
+        counts = {"fresh": 0, "stale": 0, "pending": 0}
+        covered: set[int] = set()
+        ordered = True
+        last_end: int | None = None
+        for cue in cues:
+            m = entries.get(cue["id"])
+            status = "pending"
+            info = None
+            if m:
+                seg = [source[i] for i in sorted(source) if m["source_start_index"] <= i <= m["source_end_index"]]
+                covered.update(s["cue_index"] for s in seg)
+                if last_end is not None and m["source_start_index"] <= last_end:
+                    ordered = False
+                last_end = max(last_end if last_end is not None else m["source_end_index"], m["source_end_index"])
+                stale = not seg or any(s["revision"] > m["source_revision"] for s in seg)
+                status = "stale" if stale else "fresh"
+                info = {
+                    "source_start_index": m["source_start_index"],
+                    "source_end_index": m["source_end_index"],
+                    "source_revision": m["source_revision"],
+                    "source_text": " ".join(s["text"] for s in seg),
+                }
+            counts[status] += 1
+            items.append(cue | {"mapping": info, "mapping_status": status})
+        complete = bool(batch) and bool(source) and ordered and covered == set(source)
+        source_revision = conn.execute("SELECT source_revision FROM projects WHERE id=?", (version["project_id"],)).fetchone()["source_revision"]
+        summary = {"total": len(cues), **counts, "complete": complete, "source_revision": source_revision}
+        return {"batch": dict(batch) if batch else None, "items": items, "summary": summary}
+
+    def _batch_payload(self, conn: sqlite3.Connection, batch: sqlite3.Row) -> dict[str, Any]:
+        entries = [dict(r) for r in conn.execute(
+            "SELECT m.*,c.cue_index FROM mappings m JOIN cues c ON c.id=m.cue_id WHERE m.batch_id=? ORDER BY c.cue_index",
+            (batch["id"],),
+        ).fetchall()]
+        return {"batch": dict(batch), "entries": entries}
+
+    def save_mapping_batch(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
+        mappings_in = payload.get("mappings")
+        if not isinstance(mappings_in, list) or not mappings_in:
+            raise DomainError("映射批次不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            version = self._version(conn, version_id)
+            if version["status"] != "draft":
+                raise DomainError("只有草稿版本可以修改映射", 409)
+            if not self._can_edit(conn, version, actor):
+                raise DomainError("没有该版本的翻译或时间轴权限", 403)
+            entries = []
+            for raw in mappings_in:
+                try:
+                    entries.append({
+                        "cue_id": int(raw.get("cue_id")),
+                        "source_start_index": int(raw.get("source_start_index")),
+                        "source_end_index": int(raw.get("source_end_index")),
+                    })
+                except (TypeError, ValueError, AttributeError) as exc:
+                    raise DomainError("映射条目必须包含整数 cue_id、source_start_index、source_end_index") from exc
+            content_hash = hashlib.sha256(json.dumps(sorted(entries, key=lambda e: e["cue_id"]), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            idem = payload.get("idempotency_key")
+            idem = str(idem).strip() if idem is not None else ""
+            current = self._active_batch(conn, version_id)
+            source_revision = int(conn.execute("SELECT source_revision FROM projects WHERE id=?", (version["project_id"],)).fetchone()["source_revision"])
+            # 重复提交不重复入库：幂等键或内容相同的重试直接返回已入库批次；
+            # 但原文已变更时，相同区间是有意义的重新确认，必须按新原文修订入库
+            if idem:
+                dup = conn.execute("SELECT * FROM mapping_batches WHERE version_id=? AND idempotency_key=?", (version_id, idem)).fetchone()
+                if dup:
+                    return self._batch_payload(conn, dup) | {"duplicate": True}
+            if current and current["content_hash"] == content_hash and int(current["source_revision"]) == source_revision:
+                return self._batch_payload(conn, current) | {"duplicate": True}
+            try:
+                base = int(payload.get("base_batch_no") or 0)
+            except (TypeError, ValueError) as exc:
+                raise DomainError("base_batch_no 必须是整数") from exc
+            current_no = int(current["batch_no"]) if current else 0
+            if base != current_no:
+                # 两人同时提交同一批映射：先到的生效，后到的保留输入并看到冲突
+                raise DomainError(
+                    "映射批次已被其他成员更新，请基于最新批次重新提交", 409,
+                    extra={
+                        "current_batch": self._batch_payload(conn, current) if current else None,
+                        "your_input": {"base_batch_no": base, "mappings": entries},
+                    },
+                )
+            cues = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM cues WHERE version_id=?", (version_id,)).fetchall()}
+            source = self._source_cues(conn, version["project_id"])
+            if not source:
+                raise DomainError("项目还没有原文字幕，无法建立映射")
+            mapped_ids = [e["cue_id"] for e in entries]
+            if len(set(mapped_ids)) != len(mapped_ids):
+                raise DomainError("同一译文字幕不能重复映射")
+            if any(cid not in cues for cid in mapped_ids):
+                raise DomainError("映射包含不属于该版本的译文字幕", 404)
+            missing = sorted(cid for cid in cues if cid not in set(mapped_ids))
+            if missing:
+                raise DomainError("还有译文字幕缺少映射，请先完成全部映射", 409, extra={"unmapped_cue_ids": missing})
+            # 一张译文覆盖连续的一段原文；映射按译文顺序铺满原文，不交叉也不留空
+            source_indices = sorted(source)
+            expanded: list[int] = []
+            for e in sorted(entries, key=lambda x: cues[x["cue_id"]]["cue_index"]):
+                if e["source_start_index"] > e["source_end_index"]:
+                    raise DomainError("映射区间起点不能大于终点")
+                seg = [i for i in source_indices if e["source_start_index"] <= i <= e["source_end_index"]]
+                if not seg:
+                    raise DomainError("映射区间没有对应任何原文字幕")
+                expanded.extend(seg)
+            if expanded != source_indices:
+                raise DomainError("映射必须按译文顺序连续覆盖全部原文字幕，不能交叉或留空", 409)
+            batch_no = current_no + 1
+            if current:
+                conn.execute("UPDATE mapping_batches SET status='superseded' WHERE id=?", (current["id"],))
+            cur = conn.execute(
+                "INSERT INTO mapping_batches(version_id,batch_no,source_revision,content_hash,idempotency_key,status,created_by,created_at) VALUES(?,?,?,?,?,'active',?,?)",
+                (version_id, batch_no, source_revision, content_hash, idem or None, actor, utcnow()),
+            )
+            for e in entries:
+                conn.execute(
+                    "INSERT INTO mappings(batch_id,cue_id,source_start_index,source_end_index,source_revision) VALUES(?,?,?,?,?)",
+                    (cur.lastrowid, e["cue_id"], e["source_start_index"], e["source_end_index"], source_revision),
+                )
+            self._audit(conn, actor, "mapping.saved", "version", version_id, {"batch_id": cur.lastrowid, "batch_no": batch_no, "source_revision": source_revision, "entries": len(entries)})
+            batch = conn.execute("SELECT * FROM mapping_batches WHERE id=?", (cur.lastrowid,)).fetchone()
+            return self._batch_payload(conn, batch) | {"duplicate": False}
+
+    def get_mappings(self, version_id: int) -> dict[str, Any]:
+        """返回最近一个完整映射批次；写入失败时事务回滚，这里永远是可恢复的最新完整状态。"""
+        with self.connect() as conn:
+            version = self._version(conn, version_id)
+            health = self._mapping_health(conn, version)
+            entries = [
+                {"cue_id": item["id"], "cue_index": item["cue_index"], "text": item["text"], **item["mapping"], "status": item["mapping_status"]}
+                for item in health["items"] if item["mapping"]
+            ]
+            return {"batch": health["batch"], "entries": entries, "complete": health["summary"]["complete"], "summary": health["summary"]}
+
+    def version_detail(self, version_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            version = self._version(conn, version_id)
+            health = self._mapping_health(conn, version)
+            return {"version": dict(version), "mapping": {"batch": health["batch"], "summary": health["summary"]}, "cues": health["items"]}
+
+    def review_queue(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT v.*,p.owner,p.duration_ms,p.name AS project_name FROM versions v JOIN projects p ON p.id=v.project_id WHERE v.status='review' ORDER BY v.updated_at"
+            ).fetchall()
+            return [{"version": dict(r), "mapping": self._mapping_health(conn, r)["summary"]} for r in rows]
+
+    def migrate_legacy(self, actor: str = "system") -> dict[str, Any]:
+        """旧数据迁移：缺映射的译文字幕保持待确认，确认前不进入复核或交付。"""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            pending = []
+            audited = 0
+            rows = conn.execute("SELECT v.*,p.owner,p.duration_ms FROM versions v JOIN projects p ON p.id=v.project_id ORDER BY v.id").fetchall()
+            for v in rows:
+                if not conn.execute("SELECT 1 FROM cues WHERE version_id=? LIMIT 1", (v["id"],)).fetchone():
+                    continue
+                summary = self._mapping_health(conn, v)["summary"]
+                if not summary["pending"] and not summary["stale"] and summary["complete"]:
+                    continue
+                if not conn.execute("SELECT 1 FROM audit_log WHERE action='migration.pending_mapping' AND entity_type='version' AND entity_id=?", (v["id"],)).fetchone():
+                    self._audit(conn, actor, "migration.pending_mapping", "version", v["id"], {"pending": summary["pending"], "stale": summary["stale"]})
+                    audited += 1
+                bounced = v["status"] in {"review", "approved", "locked"}
+                if bounced:
+                    conn.execute("UPDATE versions SET status='draft',updated_at=? WHERE id=?", (utcnow(), v["id"]))
+                pending.append({"version_id": v["id"], "language": v["language"], "status": v["status"], "bounced_to_draft": bounced,
+                                "pending": summary["pending"], "stale": summary["stale"], "complete": summary["complete"]})
+            return {"audited": audited, "pending_versions": pending}
+
     def add_comment(self, version_id: int, actor: str, payload: dict[str, Any], role: str = "viewer") -> dict[str, Any]:
         body = str(payload.get("body", "")).strip()
         try:
@@ -323,6 +622,13 @@ class Database:
                 raise DomainError("只有草稿版本的翻译或时间轴人员可以提交复核", 409)
             if not conn.execute("SELECT 1 FROM cues WHERE version_id=?", (version_id,)).fetchone():
                 raise DomainError("空版本不能提交复核", 409)
+            summary = self._mapping_health(conn, version)["summary"]
+            if summary["pending"]:
+                raise DomainError("存在待确认映射的译文字幕，确认前不能提交复核", 409)
+            if summary["stale"]:
+                raise DomainError("原文已变更，部分译文映射失效，请重新确认映射", 409)
+            if not summary["complete"]:
+                raise DomainError("映射尚未连续覆盖全部原文字幕，不能提交复核", 409)
             conn.execute("UPDATE versions SET status='review',updated_at=? WHERE id=?", (utcnow(), version_id))
             self._audit(conn, actor, "version.submitted", "version", version_id, {})
         return dict(conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone())
@@ -341,6 +647,11 @@ class Database:
                 raise DomainError("没有该版本的复核权限", 403)
             if actor == version["created_by"]:
                 raise DomainError("创建人不能复核自己的版本", 403)
+            summary = self._mapping_health(conn, version)["summary"]
+            if summary["pending"] or summary["stale"] or not summary["complete"]:
+                conn.execute("UPDATE versions SET status='draft',updated_at=? WHERE id=?", (utcnow(), version_id))
+                self._audit(conn, actor, "version.review_invalidated", "version", version_id, {"reason": "mapping_stale"})
+                raise DomainError("原文已变更，复核结果失效，版本已退回草稿", 409)
             conn.execute("INSERT INTO reviews(version_id,reviewer,decision,comment,created_at) VALUES(?,?,?,?,?)", (version_id, actor, decision, str(payload.get("comment", "")), utcnow()))
             status = "approved" if decision == "approve" else "draft"
             conn.execute("UPDATE versions SET status=?,updated_at=? WHERE id=?", (status, utcnow(), version_id))
@@ -368,9 +679,19 @@ class Database:
                 raise DomainError("只有批准或锁定版本可以交付", 409)
             if conn.execute("SELECT 1 FROM deliveries WHERE version_id=?", (version_id,)).fetchone():
                 raise DomainError("该版本已经交付，不能用新内容覆盖", 409)
+            health = self._mapping_health(conn, version)
+            summary = health["summary"]
+            if summary["pending"] or summary["stale"] or not summary["complete"]:
+                raise DomainError("存在待确认或已失效的映射，不能交付", 409)
             cues = [dict(r) for r in conn.execute("SELECT cue_index,start_ms,end_ms,text FROM cues WHERE version_id=? ORDER BY cue_index", (version_id,))]
             glossary = [dict(r) for r in conn.execute("SELECT source_term,required_translation,forbidden_terms FROM glossaries WHERE project_id=? ORDER BY source_term", (version["project_id"],))]
-            manifest = {"project_id": version["project_id"], "version_id": version_id, "language": version["language"], "version_no": version["version_no"], "cues": cues, "glossary": glossary}
+            mapping = {
+                "batch_id": health["batch"]["id"],
+                "batch_no": health["batch"]["batch_no"],
+                "source_revision": health["batch"]["source_revision"],
+                "entries": [{"cue_id": item["id"], "cue_index": item["cue_index"], **item["mapping"]} for item in health["items"]],
+            }
+            manifest = {"project_id": version["project_id"], "version_id": version_id, "language": version["language"], "version_no": version["version_no"], "cues": cues, "glossary": glossary, "mapping": mapping}
             snapshot_hash = hashlib.sha256(json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
             previous = conn.execute("SELECT id FROM deliveries WHERE version_id IN (SELECT id FROM versions WHERE project_id=? AND language=? AND id<>?) ORDER BY id DESC LIMIT 1", (version["project_id"], version["language"], version_id)).fetchone()
             if previous:
@@ -413,10 +734,18 @@ class Database:
 
 
 def seed_demo(db: Database) -> dict[str, int]:
-    if db.list_projects():
-        return {"project": int(db.list_projects()[0]["id"])}
+    projects = db.list_projects()
+    if projects:
+        versions = db.list_versions(projects[0]["id"])
+        return {"project": int(projects[0]["id"]), "version": int(versions[0]["id"]) if versions else 0}
     project = db.create_project("alice", {"name": "极地纪录片字幕", "source_language": "en", "media_name": "polar.mp4", "media_sha256": "b" * 64, "duration_ms": 120000}, "owner")
     db.set_glossary(project["id"], "alice", {"source_term": "seal", "required_translation": "海豹", "forbidden_terms": ["密封"], "notes": "动物学语境"}, "owner")
+    for i, (start, end, text) in enumerate([
+        (1000, 3000, "A seal rests on the sea ice."),
+        (3500, 5500, "It listens for the tide."),
+        (6000, 8000, "Winter is coming."),
+    ]):
+        db.save_source_cue(project["id"], "alice", {"cue_index": i + 1, "start_ms": start, "end_ms": end, "text": text, "expected_revision": i}, "owner")
     version = db.create_version(project["id"], "alice", {"language": "zh-CN"}, "owner")
     return {"project": int(project["id"]), "version": int(version["id"])}
 
@@ -466,16 +795,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send({"versions": self.db.list_versions()})
             if parsed.path == "/api/deliveries":
                 return self._send({"deliveries": self.db.list_deliveries()})
+            if parsed.path == "/api/review-queue":
+                return self._send({"queue": self.db.review_queue()})
             if parsed.path == "/api/audit":
                 return self._send({"audit": self.db.audit()})
             parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "source-cues":
+                return self._send({"source_cues": self.db.list_source_cues(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "cues":
                 return self._send({"cues": self.db.list_cues(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comments":
                 return self._send({"comments": self.db.list_comments(int(parts[2]))})
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "mappings":
+                return self._send(self.db.get_mappings(int(parts[2])))
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "detail":
+                return self._send(self.db.version_detail(int(parts[2])))
             raise DomainError("接口不存在", 404)
         except (ValueError, DomainError) as exc:
-            self._send({"error": str(exc)}, getattr(exc, "status", 400))
+            self._send({"error": str(exc)} | getattr(exc, "extra", {}), getattr(exc, "status", 400))
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -489,10 +826,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.create_version(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "glossary":
                 return self._send(self.db.set_glossary(int(parts[2]), actor, body, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "source-cues":
+                return self._send(self.db.save_source_cue(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "assignments":
                 return self._send(self.db.assign(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "cues":
                 return self._send(self.db.save_cue(int(parts[2]), actor, body, role), 201)
+            if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "mappings":
+                return self._send(self.db.save_mapping_batch(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "comments":
                 return self._send(self.db.add_comment(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] in {"submit", "lock", "deliver"}:
@@ -506,7 +847,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.review(int(parts[2]), actor, body, role))
             raise DomainError("接口不存在", 404)
         except (ValueError, TypeError, DomainError) as exc:
-            self._send({"error": str(exc)}, getattr(exc, "status", 400))
+            self._send({"error": str(exc)} | getattr(exc, "extra", {}), getattr(exc, "status", 400))
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[subtitle] {self.address_string()} - {fmt % args}")
@@ -517,11 +858,16 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8009")))
     parser.add_argument("--db", default=os.getenv("SUBTITLE_DB", str(DEFAULT_DB)))
     parser.add_argument("--init", action="store_true", help="创建数据库和示例项目")
+    parser.add_argument("--migrate", action="store_true", help="迁移旧数据：缺映射的译文字幕标记为待确认")
     args = parser.parse_args()
     db = Database(args.db)
     if args.init:
         seed = seed_demo(db)
         print(f"initialized database at {args.db}; project={seed['project']} version={seed['version']}")
+        return
+    if args.migrate:
+        report = db.migrate_legacy()
+        print(json.dumps(report, ensure_ascii=False, indent=2))
         return
     Handler.db = db
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
